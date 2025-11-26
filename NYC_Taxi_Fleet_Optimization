@@ -1,0 +1,209 @@
+# import tensorflow as tf
+# print("Num GPUs Available:", len(tf.config.list_physical_devices('GPU')))
+# pip install pandas
+# pip install pyarrow
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import matplotlib.pyplot as plt
+import datetime
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, losses
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.layers import Dense
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+
+trips = pq.read_table('yellow_tripdata_2025-07.parquet')
+trips = trips.to_pandas()
+
+# ----- Start Cleaning -----
+
+# trips.describe()
+# drop irrelevant columns.
+# these columns don't hold any relevant data and information for the ML and demand forecasting model.
+# these columns hold financial and technical operational information. just 'noise' for this model.
+trips = trips.drop(columns=['VendorID', 'store_and_fwd_flag', 'total_amount', 'extra', 'mta_tax', 'tip_amount', 'tolls_amount'
+    , 'improvement_surcharge', 'congestion_surcharge', 'cbd_congestion_fee'], axis=1)
+
+# keep only rows where 'passenger_count is > 0
+trips = trips[trips['passenger_count'] > 0]
+
+# Create a list of the zones
+manhattan_zones = [12, 88, 87, 261, 13, 209, 45, 231, 232, 148, 144, 211, 125, 158, 249, 114, 113, 79, 4,
+                   246, 68, 90, 234, 107, 224, 186, 164, 137, 170, 233, 100, 50, 48, 230, 161, 162, 229, 163, 202, 140,
+                   141, 237, 143, 142, 43, 239, 236, 263, 262, 238, 75, 151, 24, 194, 74, 41, 166, 152, 42, 116, 244,
+                   120, 243, 127, 128, 153]
+
+# The dataset holds information for zones also outside Manhattan.
+# So keep only rows where pick-up and drop-off locations are in Manhattan area
+trips = trips[trips['PULocationID'].isin(manhattan_zones)]
+trips = trips[trips['DOLocationID'].isin(manhattan_zones)]
+
+# keep only rows where RatecodeID = 1 (a ride only inside New York). Then drop the column
+trips = trips[trips['RatecodeID'] == 1]
+trips = trips.drop(columns=['RatecodeID'])
+
+# keep only rows in which the payment method was cash or card
+trips = trips[(trips['payment_type'] >= 1) & (trips['payment_type'] <= 2)]
+
+# remove rows in which the airport fee is > 0, which means the ride started or ended in the airport. then delete the column
+trips = trips[trips['Airport_fee'] != 1.75]
+trips = trips.drop(columns=['Airport_fee'], axis=0)
+
+# when I did trips.describe() I saw that the 'min' for trip_distance is 0
+# I want trip distances greater than 0.062 mile (100 meters) and less than 30 mile (48 km).
+trips = trips[(trips['trip_distance'] > 0.062) & (trips['trip_distance'] < 30)]
+trips = trips.reset_index(drop=True)
+
+# Rename these 2 columns
+trips = trips.rename(columns={'tpep_pickup_datetime': 'pickup_datetime'})
+trips = trips.rename(columns={'tpep_dropoff_datetime': 'dropoff_datetime'})
+
+# Round down the minutes
+trips['pickup_datetime'] = trips['pickup_datetime'].dt.floor('min')
+trips['dropoff_datetime'] = trips['dropoff_datetime'].dt.floor('min')
+
+# drop trips where the fare amount is less than 2 dollars
+trips = trips[trips['fare_amount'] > 2]
+
+# Create a mask for the anomalous trips (Same PU/DO Zone AND distance > 1.5 miles)
+# It is ok to start and finish in the same zone but the distnace must be lower than 1.5miles
+same_loc_long_trip = (trips['PULocationID'] == trips['DOLocationID']) & (trips['trip_distance'] > 1.5)
+
+# Keep only the rows where the mask is False (keep all non-anomalous trips)
+trips = trips[~same_loc_long_trip].copy()
+
+# Print the number of deleted rows from this mask
+# print(f"Deleted {trips.shape[0] - trips_cleaned.shape[0]} anomalous trips.")
+# calculate the trip length in seconds between the drop-off and the pick-up
+# we will calculate later V=x/t and use V as a new column.
+delta_sec = trips['dropoff_datetime'] - trips['pickup_datetime']  # this leaves the result as hh:mm:ss
+trip_t_sec = delta_sec.dt.total_seconds()  # this turns the time from hh:mm:ss to seconds
+
+# Create a mask to remove all rows where trip time is zero
+# It is good twice because I won't devide by zero
+trip_t_mask = (trip_t_sec > 0)
+trips = trips[trip_t_mask]
+
+# here we calculate the average speed (in miles per second) of the trip by doing
+V_mile_per_sec = trips['trip_distance'] / trip_t_sec
+# multiply by 3600 to get the avg speed in mile per hour
+V_mph = V_mile_per_sec * 3600
+trips['trip_speed_mph'] = V_mph  # Create a new column - the avg speed in mph
+
+# Leave rows where the avg speed is in range of 2<V<80 [mph]
+trips = trips[(trips['trip_speed_mph'] > 2) & (trips['trip_speed_mph'] < 80)]
+
+# create a copy of the trips df, call it demand_df
+temp_df = trips.copy()
+# rounds the pickup time to the lower 15min interval
+temp_df['bin_interval_15min'] = temp_df.loc[:, 'pickup_datetime'].dt.floor('15min')
+
+
+# Helper function to find the most frequent value in a group
+def most_frequent(x):
+    # If the group is not empty, return the most frequent value ([0] for the first value)
+    if not x.mode().empty:
+        return x.mode()[0]
+    else:
+        return np.nan
+
+
+temp_df = temp_df.groupby(['PULocationID', 'bin_interval_15min'])
+temp_df = temp_df.agg({'passenger_count': ['count', 'sum', 'min', 'max'], 'trip_distance': ['min', 'max', 'mean'],
+                       'fare_amount': ['min', 'max'], 'trip_speed_mph': ['min', 'max', 'mean'], 'DOLocationID': [most_frequent]}).reset_index()
+# Flatten the two level column names to a one level name
+# Store the list of the current column names
+current_columns = temp_df.columns
+
+# Joins the two levels of the tuple ('trip_distance', 'min') --> ('trip_distance_min')
+new_column_names = []
+# col[0] is the outer name and col[1] is the inner name
+for col in current_columns:
+    if col[1] == '':
+        new_column_names.append(col[0])
+    else:
+        new_column_names.append(f'{col[0]}_{col[1]}')
+
+# Assign the new names back to the DataFrame
+temp_df.columns = new_column_names
+demand_df = temp_df.copy()
+# Counts how many times each zone is the most frequent
+# demand_df.DOLocationID_most_frequent.value_counts()
+demand_df = demand_df.rename(columns={'passenger_count_count': 'total_pickups',
+                                      'passenger_count_sum': 'total_passengers'})
+
+from sklearn.preprocessing import StandardScaler
+
+# create a df with features to be normalized
+normalize_data = demand_df[['total_pickups', 'total_passengers', 'passenger_count_min',
+                            'passenger_count_max', 'trip_distance_min', 'trip_distance_max',
+                            'trip_distance_mean', 'fare_amount_min', 'fare_amount_max', 'trip_speed_mph_min'
+    , 'trip_speed_mph_max', 'trip_speed_mph_mean']]
+scaler = StandardScaler()
+scaler.fit(normalize_data)
+scaled_array = scaler.transform(normalize_data)
+
+# Convert the NumPy array back to a DataFrame for easy use in ML
+X_scaled_df = pd.DataFrame(scaled_array, columns=normalize_data.columns)
+# Now 0 represents the average. So negative values here are values that were smaller than the average before normalization
+# Positive values here are values that were higher than the average before the normalization
+# X_scaled_df is the cleaned & normalized df of the features. Will be the input to train the autoencoder
+
+extract_columns = demand_df[['PULocationID', 'bin_interval_15min', 'DOLocationID_most_frequent']]
+demand_scaled = pd.concat([extract_columns, X_scaled_df], axis=1)
+demand_scaled.head()
+
+# demand_scaled is the final DataFrame (normalized) which will be the input to the autoencoder
+# print(f"TensorFlow version: {tf.__version__}")
+# print(f"Keras version: {tf.keras.__version__}")
+# This should be > 0 and usually show 1 if GPU is detected
+# print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
+
+# This will list the device name (NVIDIA GeForce RTX 4050...)
+# print("GPU Details:")
+# tf.config.list_physical_devices('GPU')
+input_features = len(X_scaled_df.columns)
+custom_optimizer = Adam(learning_rate=0.001)  # Change the learning rate to be 10 times smaller
+
+model = keras.Sequential([
+    keras.layers.Dense(8, input_shape=(input_features,), activation='linear', name="layer1"),  # input layer
+    keras.layers.Dense(4, activation='relu', name="layer2"),  # hidden layer 1
+    keras.layers.Dense(4, activation='relu', name="layer3"),  # hidden layer 2
+    keras.layers.Dense(4, activation='relu', name="layer4"),  # hidden layer 3
+    keras.layers.Dense(8, activation='relu', name="layer5"),  # hidden layer 4
+    keras.layers.Dense(len(X_scaled_df.columns), activation='linear', name="layer6"),  # output layer
+])
+model.compile(optimizer=custom_optimizer, loss='mse', metrics=['mse'])
+# Create the callback instance
+lr_scheduler = ReduceLROnPlateau(
+    monitor='val_loss',  # The metric to monitor (must be present in model.compile metrics/loss)
+    factor=0.1,  # Factor by which the learning rate will be reduced (new_lr = current_lr * factor)
+    patience=5,  # Number of epochs with no improvement after which learning rate will be reduced
+    min_lr=0.00001,  # Lower bound on the learning rate it - won't go below this
+    verbose=1  # Prints a message when the LR is reduced
+)
+x = X_scaled_df
+X_train, X_test = train_test_split(x, test_size=0.2, random_state=42)  # fixed seed for reproducibility
+y_train = X_train
+y_test = X_test
+history = model.fit(x=X_train, y=y_train, epochs=50,  batch_size=32, verbose=1, validation_data=(X_test, y_test), callbacks=[lr_scheduler])
+
+model.save_weights('autoencoder_best_final.h5')
+
+test_loss, test_mse = model.evaluate(
+    x=X_test,
+    y=y_test,
+    batch_size=64,
+    verbose=0  # Set to 1 to see the progress bar
+)
+
+print(f"Final Test MSE (Loss): {test_loss:.4f}")
+print(f"Final Test RMSE: {test_loss ** 0.5:.4f}")
+
+reconstructed_data = model.predict(X_test)
+after_ae = pd.DataFrame(reconstructed_data)
