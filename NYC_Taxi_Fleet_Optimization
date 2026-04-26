@@ -6,33 +6,28 @@
 
 import numpy as np
 import pandas as pd
-import seaborn as sns
+import matplotlib.pyplot as plt
 import umap
 import pyarrow.parquet as pq
-import matplotlib.pyplot as plt
 import joblib
-import datetime
 import tensorflow as tf
 from tensorflow import keras
-from sklearn.cluster import KMeans
-from tensorflow.keras import layers, losses
-from tensorflow.keras.models import Model, Sequential
-from tensorflow.keras.layers import Dense
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from tensorflow.keras.layers import Dense
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ReduceLROnPlateau
-from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint
 
 trips = pq.read_table('yellow_tripdata_2025-07.parquet')
 trips = trips.to_pandas()
+#trips.describe()
+trips['passenger_count'].value_counts()
+no_passengers = trips[trips['passenger_count'] == 0 ]
+#no_passengers.shape
 
-###### Start Cleaning
-
+# -------- Start Cleaning --------
 # see columns names
 print(trips.columns)
-
-# trips.describe()
 
 # drop irrelevant columns.
 # these columns don't hold any relevant data and information for the ML and demand forecasting model.
@@ -41,14 +36,14 @@ trips = trips.drop(columns =['VendorID', 'store_and_fwd_flag', 'total_amount', '
                      , 'improvement_surcharge', 'congestion_surcharge', 'cbd_congestion_fee'], axis=1 )
 
 # keep only rows where passenger_count is > 0
-trips = trips[trips['passenger_count'] > 0 ] 
+trips = trips[(trips['passenger_count'] > 0) & (trips['passenger_count'] <= 6) ]
 
 # Create a list of the zones
 manhattan_zones = [12, 88, 87, 261, 13, 209, 45, 231, 232, 148, 144, 211, 125, 158, 249, 114, 113, 79, 4,
                    246, 68, 90, 234, 107, 224, 186, 164, 137, 170, 233, 100, 50, 48, 230, 161, 162, 229, 163, 202, 140,
-                   141, 237, 143, 142, 43, 239, 236, 263, 262, 238, 75, 151, 24, 194, 74, 41, 166, 152, 42, 116, 244, 
-                   120, 243, 127, 128, 153]
-# The dataset holds information for zones also outside Manhattan. 
+                   141, 237, 143, 142, 43, 239, 236, 263, 262, 238, 75, 151, 24, 194, 74, 41, 166, 152, 42, 116, 244,
+                   120, 243, 127, 128, 153, 105]
+# The dataset holds information for zones also outside Manhattan.
 # So keep only rows where pick-up and drop-off locations are in Manhattan area
 trips = trips[trips['PULocationID'].isin(manhattan_zones)]
 trips = trips[trips['DOLocationID'].isin(manhattan_zones)]
@@ -65,9 +60,8 @@ trips = trips[trips['Airport_fee'] != 1.75]
 trips = trips.drop(columns =['Airport_fee'], axis=0)
 
 # when I did trips.describe() I saw that the 'min' for trip_distance is 0
-# I want trip distances greater than 0.062 mile (100 meters) and less than 20 mile (32.2 km).
-trips = trips[(trips['trip_distance'] > 0.062) & (trips['trip_distance'] < 20)]
-
+# I want trip distances greater than 0.062 mile (100 meters) and less than 17 mile (27.35 km).
+trips = trips[(trips['trip_distance'] > 0.062) & (trips['trip_distance'] < 17)]
 trips = trips.reset_index(drop=True)
 
 # Rename these 2 columns
@@ -78,8 +72,8 @@ trips = trips.rename(columns={'tpep_dropoff_datetime': 'dropoff_datetime'})
 trips['pickup_datetime'] = trips['pickup_datetime'].dt.floor('min')
 trips['dropoff_datetime'] = trips['dropoff_datetime'].dt.floor('min')
 
-# drop trips where the fare amount is less than 2 dollars
-trips = trips[trips['fare_amount'] > 2]
+# keep trips where the fare amount is more than 3 dollars
+trips = trips[trips['fare_amount'] > 3]
 
 # Create a mask for the anomalous trips (Same PU/DO Zone AND distance > 1.8 miles)
 # It is ok to start and finish in the same zone but the distnace must be lower than 1.8miles
@@ -90,49 +84,65 @@ trips = trips[~same_loc_long_trip].copy()
 
 # Print the number of deleted rows from this mask
 # print(f"Deleted {trips.shape[0] - trips_cleaned.shape[0]} anomalous trips.")
-
 # calculate the trip length in seconds between the drop-off and the pick-up
 # we will calculate later V=x/t and use V as a new column.
 delta_sec = trips['dropoff_datetime'] - trips['pickup_datetime'] # this leaves the result as hh:mm:ss
 trip_t_sec = delta_sec.dt.total_seconds() # this turns the time from hh:mm:ss to seconds
+trip_t_sec.describe()
 
-# Create a mask to remove all rows where trip time is zero
+# remove all rows where trip time is more than 0 seconds & less than 2 hours
 # It is good twice because I won't devide by zero
-trip_t_mask = (trip_t_sec > 0 )
+trip_t_mask = (trip_t_sec > 0) & (trip_t_sec < 7200)
 trips = trips[trip_t_mask]
+trips.describe()
 
 # here we calculate the average speed (in miles per second) of the trip by doing
 V_mile_per_sec = trips['trip_distance'] / trip_t_sec
+
 # multiply by 3600 to get the avg speed in mile per hour
 V_mph = V_mile_per_sec * 3600
 trips['trip_speed_mph'] = V_mph  # Create a new column - the avg speed in mph
 
 # Leave rows where the avg speed is in range of 2<V<50 [mph]
 trips = trips[(trips['trip_speed_mph'] > 2) & (trips['trip_speed_mph'] < 50)]
-
-#print(trips.describe())
+trips.columns
+trips.shape
 
 # create a copy of the trips df, call it demand_df
 temp_df = trips.copy()
+
 # rounds the pickup time to the lower 15min interval
 temp_df['bin_interval_15min'] = temp_df.loc[:,'pickup_datetime'].dt.floor('15min')
 
-# Helper function to find the most frequent value in a group
+# cylical properties (time)
+temp_df['hour'] = temp_df['bin_interval_15min'].dt.hour
+temp_df['day_of_week'] = temp_df['bin_interval_15min'].dt.dayofweek
+
+# encode cyclical time features to capture daily periodicity
+temp_df['hour_sin'] = np.sin(2 * np.pi * temp_df['hour'] / 24)
+temp_df['hour_cos'] = np.cos(2 * np.pi * temp_df['hour'] / 24)
+temp_df['day_sin'] = np.sin(2 * np.pi * temp_df['day_of_week'] / 7)
+temp_df['day_cos'] = np.cos(2 * np.pi * temp_df['day_of_week'] / 7)
+# helper function to find the most frequent value in a group
 def most_frequent(x):
     # If the group is not empty, return the most frequent value ([0] for the first value)
     if not x.mode().empty:
-        return x.mode()[0] 
+        return x.mode()[0]
     else :
         return np.nan
-
 temp_df = temp_df.groupby(['PULocationID', 'bin_interval_15min'])
 temp_df = temp_df.agg({
-    'passenger_count': ['count', 'sum', 'max', 'mean'],          # <--- VITAL: Quantity of Demand
-    'trip_distance': ['std', 'max', 'mean'],      # Quality: Distance profile
-    'fare_amount': ['std', 'max', 'mean'],        # Quality: Economic profile
-    'trip_speed_mph': ['std', 'mean', 'max'],            # Quality: Traffic profile
-    'DOLocationID': [most_frequent]               # Destination profile
+    'passenger_count': ['count', 'sum', 'max', 'mean'],
+    'trip_distance': ['std', 'max', 'mean'],
+    'fare_amount': ['std', 'max', 'mean'],
+    'trip_speed_mph': ['std', 'mean', 'max'],
+    'DOLocationID': [most_frequent],
+    'hour_sin': 'first',
+    'hour_cos': 'first',
+    'day_sin': 'first',
+    'day_cos': 'first'
 }).reset_index()
+temp_df.info()
 
 # Flatten the two level column names to a one level name
 # Store the list of the current column names
@@ -140,74 +150,73 @@ current_columns = temp_df.columns
 
 # Joins the two levels of the tuple ('trip_distance', 'min') --> ('trip_distance_min')
 new_column_names = []
+
 # col[0] is the outer name and col[1] is the inner name
 for col in current_columns:
     if col[1] == '':
         new_column_names.append(col[0])
     else:
         new_column_names.append(f'{col[0]}_{col[1]}')
-
 # If a zone had only 1 trip, std is NaN. We fill it with 0.
 temp_df = temp_df.fillna(0)
 
 # Assign the new names back to the DataFrame
 temp_df.columns = new_column_names
-
+temp_df.describe()
 demand_df = temp_df.copy()
 
-# Counts how many times each zone is the most frequent
+# Counts how many times each zone is the most frequent for a drop-off
 # demand_df.DOLocationID_most_frequent.value_counts()
-
 demand_df = demand_df.rename(columns= {'passenger_count_count': 'total_pickups',
                                        'passenger_count_sum': 'total_passengers'})
+demand_df.columns
 
+# Calculate the index to split at (80% for training)
+split_index = int(len(demand_df) * 0.8)
 
-X_demand = demand_df[['total_pickups', 'total_passengers', 'passenger_count_max', 'passenger_count_mean',
-                      'trip_distance_std', 'trip_distance_max','trip_distance_mean',
-                      'fare_amount_std', 'fare_amount_max', 'fare_amount_mean',
-                      'trip_speed_mph_std','trip_speed_mph_max', 'trip_speed_mph_mean']]
+# split the dataframe chronologically
+train_df = demand_df.iloc[:split_index]
+test_df = demand_df.iloc[split_index:]
+features = [
+    'total_pickups', 'total_passengers', 'passenger_count_max', 'passenger_count_mean',
+    'trip_distance_std', 'trip_distance_max', 'trip_distance_mean',
+    'fare_amount_std', 'fare_amount_max', 'fare_amount_mean',
+    'trip_speed_mph_std', 'trip_speed_mph_max', 'trip_speed_mph_mean',
+    'hour_sin_first', 'hour_cos_first', 'day_sin_first', 'day_cos_first'
+]
 
-X_train, X_test = train_test_split(X_demand, test_size=0.2, random_state=42)
+# create the feature sets
+X_train = train_df[features]
+X_test = test_df[features]
 
-from sklearn.preprocessing import StandardScaler
+# scaling (fit only on train, transform both)
 scaler = StandardScaler()
-
-scaler.fit(X_train)
-X_train_scaled_array = scaler.transform(X_train)
+X_train_scaled_array = scaler.fit_transform(X_train)
 X_test_scaled_array = scaler.transform(X_test)
 
-
-# Convert the NumPy array back to a DataFrame
-X_train_scaled = pd.DataFrame(X_train_scaled_array, columns=X_demand.columns)
-X_test_scaled = pd.DataFrame(X_test_scaled_array, columns=X_demand.columns)
+# convert back to dataFrame
+X_train_scaled = pd.DataFrame(X_train_scaled_array, columns=features)
+X_test_scaled = pd.DataFrame(X_test_scaled_array, columns=features)
 y_train_scaled = X_train_scaled
 y_test_scaled = X_test_scaled
-
-# Now 0 represents the average. So negative values here are values that were smaller than the average before normalization
-# Positive values here are values that were higher than the average before the normalization
-# This is the cleaned & normalized df of the features. Will be the input to train the autoencoder
-# print(f"X_scaled_df: {X_scaled_df}")
-
-extract_columns = demand_df[['PULocationID', 'bin_interval_15min', 'DOLocationID_most_frequent']]
-
-
-input_features = len(X_demand.columns)
+input_features = len(features)
 adam_optimizer = Adam(learning_rate=0.01)
+input_layer = keras.layers.Input(shape=(input_features,), name='main_input')
 
-input_layer = keras.layers.Input(shape=(input_features,), name="main_input")
-# create the autoencoder neural network
+#create the autoencoder neural network
 model = keras.Sequential([
     input_layer, # input layer
-    keras.layers.Dense(8, activation='linear', name="layer1"), # layer 1
-    keras.layers.Dense(4, activation='tanh', name="layer2"), # layer 2 - bottleneck
-    keras.layers.Dense(8, activation='relu', name="layer3"), # layer 3
-    keras.layers.Dense(len(X_demand.columns), activation='linear', name="layer4"), # layer 4 - decoder output
+    keras.layers.Dense(10, activation='relu', name="layer1"), # layer 1
+    keras.layers.Dense(5, activation='tanh', name="layer2"), # layer 2 - bottleneck
+    keras.layers.Dense(10, activation='relu', name="layer3"), # layer 3
+    keras.layers.Dense(input_features, activation='linear', name="layer4"), # layer 4 - decoder output
 ])
+best_weights = ModelCheckpoint('best_autoencoder.keras', save_best_only=True, monitor='val_loss', mode='min')
 
 # set the settings for the neural network training
 model.compile(optimizer=adam_optimizer, loss='mse', metrics=['mse'])
 
-# adjusts the learning rate based on how well the model is performing
+# adjust the learning rate based on how well the model is performing
 lr_reducer = ReduceLROnPlateau(
     monitor='val_loss',  # the metric to monitor
     factor=0.1,          # factor by which the learning rate will be reduced (new_lr = current_lr * factor)
@@ -215,46 +224,42 @@ lr_reducer = ReduceLROnPlateau(
     min_lr=0.000001,     # smallest learning rate allowed
     verbose=1            # prints a message when the LR is reduced
 )
-
-# model_checkpoint will hold *the best* weights from all epochs and not the weights from the last epoch
-best_weights = ModelCheckpoint('C:\\Users\guyfl\PycharmProjects\Transportation_Course\\best_weights.h5',
-                               monitor='val_loss', save_best_only=True, verbose=0 )
-
 autoencoder = model.fit(x=X_train_scaled, y=X_train_scaled, epochs=50, batch_size=64, verbose=1,
                         validation_data=(X_test_scaled, y_test_scaled), callbacks=[lr_reducer, best_weights])
+model.load_weights('best_autoencoder.keras')
 
-#--------------------------- save model ---------------------------
-# 1. Save the Keras Model (The Brain)
-model.save('autoencoder_model.keras') # Saves weights and structure
-
-# 2. Save the Scaler (The Ruler) - Crucial!
-# If you lose the scaler, the model is useless because it expects scaled inputs.
-joblib.dump(scaler, 'scaler.pkl')
-
-print("Model and Scaler saved successfully.")
-#------------------------------------------------------------------
+# plot training & validation loss values
+plt.figure(figsize=(10, 6))
+plt.plot(autoencoder.history['loss'], label='Train Loss')
+plt.plot(autoencoder.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss Progress During Training')
+plt.ylabel('Loss (MSE)')
+plt.xlabel('Epoch')
+plt.legend(loc='upper right')
+plt.grid(True)
+plt.show()
 
 test_loss, test_mse = model.evaluate(x=X_test_scaled, y=y_test_scaled, batch_size=32, verbose=0 )
-
-prediction = model.predict(X_test_scaled)
-
 print(f"Final Test MSE (Loss): {test_loss:.4f}")
 print(f"Final Test RMSE: {test_loss**0.5:.4f}")
 
-# ---------- getting the latent vector ----------
-# create a new model that takes the same input as your full model and outputs the result of the bottleneck
+prediction = model.predict(X_test_scaled)
+# getting the latent vector
+# create a new model that takes the same input as in the full model and outputs the result of the bottleneck
 encoder_input = input_layer
 bottleneck_output = model.get_layer("layer2").output
 encoder_model = keras.Model(inputs=encoder_input, outputs=bottleneck_output)
 
+X_demand = demand_df[features]
 X_demand_scaled_array = scaler.transform(X_demand)
 X_demand_scaled = pd.DataFrame(X_demand_scaled_array, columns=X_demand.columns)
 
 latent_vector_array = encoder_model.predict(X_demand_scaled)
 latent_vector = pd.DataFrame(latent_vector_array)
+latent_vector.describe()
 
 umap_object = umap.UMAP(
-    n_neighbors=40,
+    n_neighbors=25,
     min_dist=0.03,
     n_components=2,
     metric='manhattan',
@@ -265,11 +270,14 @@ umap_object = umap.UMAP(
     random_state=42
 )
 u = umap_object.fit_transform(latent_vector)
-
+u.size
+u_df = pd.DataFrame(u, columns=['UMAP1', 'UMAP2'])
+u_df.describe()
 plt.figure(figsize=(10,6))
 plt.scatter(u[:,0], u[:,1], s=5)
 plt.title("UMAP of Autoencoder Latent Space")
 plt.show()
+u[:,0].size
 
 from sklearn.cluster import HDBSCAN
 hdb = HDBSCAN(
@@ -280,10 +288,43 @@ hdb = HDBSCAN(
     max_cluster_size=20000
 )
 hdb.fit(u)
-
 labels = hdb.labels_
 
 plt.figure(figsize=(10,6))
 plt.scatter(u[:,0], u[:,1], c=labels, s=3, cmap='tab20')
 plt.title("HDBSCAN Clustering on UMAP Embeddings")
 plt.show()
+# use a copy so i don't mess up the original implementation
+final_df = demand_df.copy()
+
+final_df['umap_x'] = u[:, 0]
+final_df['umap_y'] = u[:, 1]
+
+# add the Cluster Colors (Labels)
+final_df['cluster_label'] = labels
+
+# save to parquet (locks the results)
+final_df.to_parquet("final_clustered_data.parquet")
+# extract the hour
+final_df['hour'] = final_df['bin_interval_15min'].dt.hour
+
+# group by cluster and compute mean metrics
+cluster_summary = final_df.groupby('cluster_label')[['hour', 'total_pickups', 'trip_distance_mean']].mean()
+
+print(cluster_summary.sort_values('hour'))
+# ensure dataset covers full 24-hour cycle
+print("Min Hour:", final_df['hour'].min())
+print("Max Hour:", final_df['hour'].max())
+
+# count and average hour of outliers
+noise_data = final_df[final_df['cluster_label'] == -1]
+print(f"\nNoise (-1) Count: {len(noise_data)}")
+print(f"Noise (-1) Average Hour: {noise_data['hour'].mean()}")
+
+# cluster temporal spread. analyze minimum and maximum hours per cluster
+# reveals if a cluster is a specific event (narrow range) or background noise (wide range)
+hour_spread = final_df.groupby('cluster_label')['hour'].agg(['min', 'mean', 'max', 'count'])
+print("\nDetailed Hour Analysis:")
+print(hour_spread)
+final_df.cluster_label.value_counts()
+final_df.columns
